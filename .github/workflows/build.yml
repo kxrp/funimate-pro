@@ -1,0 +1,97 @@
+name: Inject FunimatePro
+
+on:
+workflow_dispatch:
+inputs:
+ipa_url:
+description: "Direct download URL to your decrypted Funimate .ipa"
+required: true
+
+env:
+TWEAK: FunimatePro
+SUBSTRATE_PATH: /usr/lib/libsubstrate.dylib
+
+jobs:
+inject:
+runs-on: macos-14
+steps:
+- uses: actions/checkout@v4
+
+- name: Toolchain
+run: |
+brew install ldid dpkg xz
+git clone --recursive --depth 1 https://github.com/theos/theos.git "$HOME/theos"
+echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+
+- name: insert_dylib
+run: |
+git clone --depth 1 https://github.com/tyilo/insert_dylib.git /tmp/idl
+xcodebuild -project /tmp/idl/insert_dylib.xcodeproj \
+-configuration Release CONFIGURATION_BUILD_DIR=/tmp/idlbin -quiet
+sudo cp /tmp/idlbin/insert_dylib /usr/local/bin/
+
+- name: Download your IPA
+run: |
+mkdir -p in out
+curl -L --fail --retry 3 -o in/Funimate.ipa "${{ github.event.inputs.ipa_url }}"
+ls -la in/
+file in/Funimate.ipa
+unzip -l in/Funimate.ipa | head -20
+unzip -l in/Funimate.ipa | grep -q "Payload/" \
+|| { echo "::error::That URL didn't return an IPA (no Payload/ inside)."; exit 1; }
+
+- name: Build tweak
+run: |
+cd FunimatePro && make package FINALPACKAGE=1 && cd ..
+cp FunimatePro/packages/*.deb out/
+dpkg-deb -x out/*.deb out/root
+find out/root -name "${TWEAK}.dylib" -exec cp {} out/ \;
+SUB=$(find "$THEOS" -name 'libsubstrate.dylib' | head -1)
+if [ -n "$SUB" ]; then cp "$SUB" out/; else echo "::error::libsubstrate missing"; exit 1; fi
+install_name_tool -change "$SUBSTRATE_PATH" \
+"@executable_path/libsubstrate.dylib" "out/${TWEAK}.dylib"
+otool -L "out/${TWEAK}.dylib"
+
+- name: Inject + ad-hoc sign
+run: |
+unzip -q in/Funimate.ipa -d work
+APP="work/Payload/$(ls work/Payload)"
+echo "Target: $APP"
+BIN="$APP/$(plutil -extract CFBundleExecutable raw -o - "$APP/Info.plist")"
+echo "Binary: $BIN"
+
+cp out/libsubstrate.dylib "$APP/libsubstrate.dylib"
+cp "out/${TWEAK}.dylib" "$APP/${TWEAK}.dylib"
+
+ldid -e "$BIN" > /tmp/ent.plist || true
+ENT=""; [ -s /tmp/ent.plist ] && ENT="--entitlements /tmp/ent.plist"
+
+insert_dylib --strip-codesig --all-yes --inplace \
+"@executable_path/${TWEAK}.dylib" "$BIN"
+insert_dylib --all-yes --inplace \
+"@executable_path/libsubstrate.dylib" "$BIN"
+
+codesign -f -s - "$APP/libsubstrate.dylib"
+codesign -f -s - "$APP/${TWEAK}.dylib"
+codesign -f -s - $ENT "$BIN"
+codesign -f -s - "$APP"
+
+echo "--- verification ---"
+otool -L "$BIN" | grep -E "substrate|${TWEAK}"
+codesign -dv "$BIN" 2>&1 | head -5
+
+cd work && zip -qry "../out/FunimatePro-tweaked.ipa" Payload
+
+- uses: actions/upload-artifact@v4
+with:
+name: tweaked-ipa
+path: out/FunimatePro-tweaked.ipa
+
+- uses: actions/upload-artifact@v4
+with:
+name: raw-files
+path: |
+out/FunimatePro.deb
+out/FunimatePro.dylib
+out/libsubstrate.dylib
